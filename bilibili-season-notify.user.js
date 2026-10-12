@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站合集更新监控 · 云湖机器人推送
 // @namespace    https://github.com/yimu56/bilibili-season-notify
-// @version      1.0.0
-// @description  定时检测 B 站指定合集是否发布新视频，检测到更新后把标题、链接与简介推送到云湖机器人
+// @version      1.1.0
+// @description  定时检测 B 站若干合集是否发布新视频，可按标题关键字过滤，命中后把标题、链接与简介推送到云湖机器人
 // @author       yimu56
 // @license      MIT
 // @homepageURL  https://github.com/yimu56/bilibili-season-notify
@@ -21,10 +21,15 @@
 
 /*
  * 工作原理
- *   1. 调用 B 站合集接口 seasons_archives_list，按发布时间倒序取最近 N 个视频；
- *   2. 与本地存储的「上次已推送时间」比对，找出更新的视频；
- *   3. 逐个取视频详情拿到简介，拼接消息推送到云湖机器人；
- *   4. 推送成功后更新本地基线，避免重复推送。
+ *   1. 依次遍历 WATCH_LIST 中的每个合集，调用 seasons_archives_list 按发布时间倒序取最近 N 个视频；
+ *   2. 与本地存储的「上次已处理时间」比对，找出新发布的视频；
+ *   3. 若该合集配置了 keywords，则只保留标题命中关键字的新视频，未命中的视为已处理并跳过；
+ *   4. 逐个取视频详情拿到简介，拼接消息推送到云湖机器人；
+ *   5. 推送成功后更新本地基线，避免重复推送。
+ *
+ * 多目标监控
+ *   WATCH_LIST 中每一项对应一个合集，各自维护独立基线（键名 bh_watch_<mid>_<seasonId>），互不影响。
+ *   keywords 为空数组表示该合集内任意新视频都推送；配置多个关键字时命中任意一个即推送。
  *
  * 定时策略
  *   @crontab * 8-23 once * *
@@ -41,13 +46,28 @@
 
 /* ==================== 配置区 ==================== */
 
-const CONFIG = {
-  // ── 监控目标 ──────────────────────────────────────────────
-  // 合集地址形如：https://space.bilibili.com/105493566/lists/75265?type=season
-  //                                    └── MID ───┘        └ SEASON_ID ┘
-  MID: 105493566,
-  SEASON_ID: 75265,
+// 监控目标列表，可配置多个合集，脚本每次执行会依次检查
+const WATCH_LIST = [
+  {
+    // 合集地址：https://space.bilibili.com/105493566/lists/75265?type=season
+    //                                  └── mid ────┘        └ seasonId ┘
+    name: 'Epic免费游戏合集',
+    mid: 105493566,
+    seasonId: 75265,
+    // 关键字为空数组：合集内任意新视频都会推送
+    keywords: [],
+  },
+  {
+    // 合集地址：https://space.bilibili.com/105493566/lists/94093?type=season
+    name: '游戏资讯',
+    mid: 105493566,
+    seasonId: 94093,
+    // 仅当新视频标题包含下列关键字之一时才推送，多个关键字为「或」的关系
+    keywords: ['神秘游戏'],
+  },
+];
 
+const CONFIG = {
   // ── 云湖机器人 ────────────────────────────────────────────
   // YUNHU_TOKEN    ：云湖控制台中「机器人发送消息链接」的 token 参数
   // YUNHU_RECV_ID  ：接收者 ID，群聊填群号，私聊填用户 ID
@@ -180,11 +200,13 @@ function videoUrl(bvid) {
 
 /* ---------------- 网络请求 ---------------- */
 
-function browserHeaders() {
-  return {
-    'User-Agent': UA,
-    Referer: 'https://space.bilibili.com/' + CONFIG.MID + '/lists/' + CONFIG.SEASON_ID + '?type=season',
-  };
+function browserHeaders(watch) {
+  const headers = { 'User-Agent': UA };
+  if (watch) {
+    headers.Referer =
+      'https://space.bilibili.com/' + watch.mid + '/lists/' + watch.seasonId + '?type=season';
+  }
+  return headers;
 }
 
 // 带重试的 JSON 请求；-352 为 B 站风控码，同样进入重试
@@ -218,16 +240,16 @@ async function requestJson(url, opt) {
   throw lastErr;
 }
 
-async function fetchSeasonArchives() {
+async function fetchSeasonArchives(watch) {
   const url =
     'https://api.bilibili.com/x/polymer/web-space/seasons_archives_list' +
-    '?mid=' + CONFIG.MID +
-    '&season_id=' + CONFIG.SEASON_ID +
+    '?mid=' + watch.mid +
+    '&season_id=' + watch.seasonId +
     '&sort_reverse=true' +
     '&page_num=1' +
     '&page_size=' + CONFIG.SCAN_SIZE;
 
-  const json = await requestJson(url, { headers: browserHeaders() });
+  const json = await requestJson(url, { headers: browserHeaders(watch) });
   if (json.code !== 0) {
     throw new Error('合集接口返回 code=' + json.code + (json.message ? ' ' + json.message : ''));
   }
@@ -338,19 +360,23 @@ function buildHtml(video, detail, seasonTitle, overflow) {
   return parts.join('');
 }
 
+/* ---------------- 关键字过滤 ---------------- */
+
+function matchKeywords(title, keywords) {
+  const text = String(title || '').toLowerCase();
+  return keywords.some((k) => {
+    const kw = String(k || '').toLowerCase();
+    return !!kw && text.indexOf(kw) >= 0;
+  });
+}
+
 /* ---------------- 主流程 ---------------- */
 
-async function main() {
-  const missing = [];
-  if (!CONFIG.YUNHU_TOKEN) missing.push('YUNHU_TOKEN');
-  if (!CONFIG.YUNHU_RECV_ID) missing.push('YUNHU_RECV_ID');
-  if (missing.length) {
-    return '配置区未填写 ' + missing.join('、') + '，本次未执行';
-  }
-
-  const stateKey = 'bh_watch_' + CONFIG.MID + '_' + CONFIG.SEASON_ID;
-  const season = await fetchSeasonArchives();
-  const seasonTitle = season.meta.title || '目标合集';
+async function runWatcher(watch) {
+  const label = watch.name || String(watch.seasonId);
+  const stateKey = 'bh_watch_' + watch.mid + '_' + watch.seasonId;
+  const season = await fetchSeasonArchives(watch);
+  const seasonTitle = season.meta.title || label;
   const newest = season.archives[0];
   const baseline = await gmGet(stateKey, null);
 
@@ -362,35 +388,51 @@ async function main() {
       updatedAt: Date.now(),
     });
 
-  let fresh = [];
-  let overflow = 0;
+  let candidates = [];
 
   if (!baseline || !baseline.pubdate) {
     if (!CONFIG.FIRST_RUN_PUSH) {
       await saveBaseline(newest);
-      const msg = '首次运行，已记录基线：' + newest.title + '（' + fmtDate(newest.pubdate) + '），不推送历史视频';
-      log(msg);
-      return msg;
+      return { label, status: 'init', message: '首次运行，已记录基线：' + newest.title };
     }
-    fresh = [newest];
+    candidates = [newest];
   } else {
-    fresh = season.archives
+    candidates = season.archives
       .filter((v) => v.pubdate > baseline.pubdate)
       .sort((a, b) => a.pubdate - b.pubdate);
 
-    if (!fresh.length) {
-      const msg = '合集《' + seasonTitle + '》暂无更新，最新一条：' + newest.title;
-      log(msg);
-      return msg;
-    }
-    if (fresh.length > CONFIG.MAX_PUSH_PER_RUN) {
-      overflow = fresh.length - CONFIG.MAX_PUSH_PER_RUN;
-      fresh = fresh.slice(-CONFIG.MAX_PUSH_PER_RUN);
+    if (!candidates.length) {
+      return { label, status: 'idle', message: '暂无更新，最新一条：' + newest.title };
     }
   }
 
+  // 关键字过滤：命中任意一个关键字才推送；未配置关键字时全部推送
+  const keywords = (watch.keywords || []).filter(Boolean);
+  const matched = keywords.length
+    ? candidates.filter((v) => matchKeywords(v.title, keywords))
+    : candidates;
+
+  if (!matched.length) {
+    // 未命中的新视频同样视为已处理，基线推进到最新，避免反复扫描
+    await saveBaseline(newest);
+    return {
+      label,
+      status: 'filtered',
+      message:
+        '检测到 ' + candidates.length + ' 条新视频，标题均未命中关键字「' +
+        keywords.join('、') + '」，已跳过',
+    };
+  }
+
+  let overflow = 0;
+  let toPush = matched;
+  if (toPush.length > CONFIG.MAX_PUSH_PER_RUN) {
+    overflow = toPush.length - CONFIG.MAX_PUSH_PER_RUN;
+    toPush = toPush.slice(-CONFIG.MAX_PUSH_PER_RUN);
+  }
+
   const pushed = [];
-  for (const video of fresh) {
+  for (const video of toPush) {
     const detail = await fetchVideoDetail(video.bvid);
     const contentType = CONFIG.CONTENT_TYPE === 'html' ? 'html' : 'markdown';
     const text =
@@ -400,18 +442,65 @@ async function main() {
 
     await pushYunhu(text, contentType);
     pushed.push(video);
-    log('已推送：' + video.title);
-    if (pushed.length < fresh.length) await sleep(800);
+    log(label + ' 已推送：' + video.title);
+    if (pushed.length < toPush.length) await sleep(800);
   }
 
-  // 仅在全部推送成功后推进基线，避免推送失败导致更新丢失
-  await saveBaseline(pushed[pushed.length - 1]);
+  // 仅在推送全部成功后推进基线，推送失败时保留基线以便下次重试
+  await saveBaseline(newest);
 
-  const summary =
-    '已推送 ' + pushed.length + ' 条更新' + (overflow > 0 ? '（另有 ' + overflow + ' 条未推送）' : '') +
-    '：' + pushed.map((v) => v.title).join(' / ');
-  notify('B站合集监控', summary);
+  return {
+    label,
+    status: 'pushed',
+    message:
+      '已推送 ' + pushed.length + ' 条' +
+      (overflow > 0 ? '（另有 ' + overflow + ' 条未推送）' : '') +
+      '：' + pushed.map((v) => v.title).join(' / '),
+  };
+}
+
+async function main() {
+  const missing = [];
+  if (!CONFIG.YUNHU_TOKEN) missing.push('YUNHU_TOKEN');
+  if (!CONFIG.YUNHU_RECV_ID) missing.push('YUNHU_RECV_ID');
+  if (missing.length) {
+    return '配置区未填写 ' + missing.join('、') + '，本次未执行';
+  }
+  if (!WATCH_LIST.length) {
+    return '监控目标列表 WATCH_LIST 为空，本次未执行';
+  }
+
+  const results = [];
+  for (let i = 0; i < WATCH_LIST.length; i++) {
+    const watch = WATCH_LIST[i];
+    if (i > 0) await sleep(1000);
+    try {
+      results.push(await runWatcher(watch));
+    } catch (err) {
+      results.push({
+        label: watch.name || String(watch.seasonId),
+        status: 'error',
+        message: '执行失败：' + ((err && err.message) || String(err)),
+      });
+    }
+  }
+
+  const summary = results.map((r) => r.label + '：' + r.message).join('\n');
   log(summary);
+
+  const pushed = results.filter((r) => r.status === 'pushed');
+  const errors = results.filter((r) => r.status === 'error');
+
+  if (pushed.length) {
+    notify('B站合集监控', pushed.map((r) => r.label + '：' + r.message).join('\n').slice(0, 200));
+  }
+  if (errors.length) {
+    notify(
+      'B站合集监控执行异常',
+      errors.map((r) => r.label + '：' + r.message).join('\n').slice(0, 200)
+    );
+  }
+
   return summary;
 }
 
